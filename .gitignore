@@ -6,7 +6,7 @@ build/
 *.hex
 
 # Real secrets - DO NOT COMMIT
-HP12/secrets.h
+HP14/secrets.h
 
 # OS files
 .DS_Store
