@@ -1,0 +1,17 @@
+# Arduino build files
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Real secrets - DO NOT COMMIT
+HP12/secrets.h
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
