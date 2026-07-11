@@ -1,11 +1,11 @@
 #pragma once
 
-// OPTIONAL fallback WiFi. HP12 also stores WiFi entered through HP12-SETUP portal.
-#define FALLBACK_WIFI_SSID     "Your_2_4GHz_WiFi"
-#define FALLBACK_WIFI_PASSWORD "Your_WiFi_Password"
+// Fallback first-boot credentials. HP14 can later be reconfigured by phone:
+// hold PAGE + FOCUS together for 5 seconds, connect to HP14-SETUP-xxxx,
+// then open http://192.168.4.1
+#define WIFI_SSID     ""
+#define WIFI_PASSWORD ""
 
-// ThingsBoard Cloud - copy EXACT Access token from device HP12.
-// Devices > HP12 > Manage credentials > Copy access token.
-#define TB_HOST  "thingsboard.cloud"
+#define TB_HOST  "mqtt.thingsboard.cloud"
 #define TB_PORT  1883
-#define TB_TOKEN "PASTE_HP12_DEVICE_ACCESS_TOKEN_HERE"
+#define TB_TOKEN "YOUR_THINGSBOARD_DEVICE_TOKEN"
