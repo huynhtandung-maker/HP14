@@ -5,18 +5,18 @@
 /*
   HP14 - CONFIGURATION
   ============================================================================
-  v1.1.0 giữ nguyên toàn bộ GPIO đã khóa.
+  v1.2.1 giữ nguyên toàn bộ GPIO đã khóa và bổ sung lớp bảo vệ hạn mức ThingsBoard.
   Chỉ chỉnh file này khi cần đổi cực tính còi, ngưỡng hoặc chu kỳ.
   Wi-Fi / ThingsBoard mặc định nằm trong secrets.h; người dùng có thể đổi Wi-Fi
   bằng portal HP14-SETUP sau khi giữ đồng thời hai nút 5 giây.
-WiFi quét trước khi mở AP, dùng danh sách cache và lưu mạng mới ở vùng pending; chỉ commit sau khi kết nối thành công.
+WiFi quét trước khi mở AP, dùng danh sách cache, lưu mạng mới ở vùng pending và duy trì kho 5 WiFi dùng gần nhất; chỉ commit sau khi kết nối thành công.
 */
 
 // -----------------------------------------------------------------------------
 // 1) Firmware
 // -----------------------------------------------------------------------------
 #define HP14_FIRMWARE_NAME    "HP14"
-#define HP14_FIRMWARE_VERSION "1.1.0-wifi-portal-stable"
+#define HP14_FIRMWARE_VERSION "1.2.1-quota-safe"
 
 #include "secrets.h"
 
@@ -141,19 +141,46 @@ static constexpr uint32_t WIFI_CONNECT_ATTEMPT_TIMEOUT_MS = 30000UL;
 static constexpr uint32_t WIFI_BOOT_RETRY_GAP_MS = 2500UL;
 static constexpr uint8_t WIFI_BOOT_MAX_ATTEMPTS = 2;
 
+// Kho WiFi MRU: luôn giữ tối đa 5 mạng đã KẾT NỐI THÀNH CÔNG gần nhất.
+// Mạng vừa kết nối được đưa lên đầu; mạng thứ 6 sẽ thay mạng cũ nhất.
+static constexpr uint8_t WIFI_SAVED_NETWORK_LIMIT = 5;
+static constexpr uint8_t WIFI_VAULT_SCHEMA_VERSION = 1;
+// Quét một lần trước khi kết nối để bỏ qua các mạng đã lưu nhưng không có mặt.
+// Mạng ẩn vẫn có thể nhập qua portal; mặc định không chờ thử mạng ẩn để tránh boot lâu.
+static constexpr bool WIFI_SCAN_SAVED_NETWORKS_ON_BOOT = true;
+static constexpr bool WIFI_TRY_SAVED_HIDDEN_NETWORKS = false;
+static constexpr uint8_t WIFI_SAVED_SCAN_MAX_ROUNDS = 2;  // Cho router thời gian khởi động lại sau mất điện.
+
 // -----------------------------------------------------------------------------
 // 8) Scheduling / network
 // -----------------------------------------------------------------------------
 static constexpr uint32_t SENSOR_INTERVAL_MS = 3000UL;
 static constexpr uint32_t UI_SERVICE_INTERVAL_MS = 35UL;
-static constexpr uint32_t TELEMETRY_INTERVAL_MS = 30000UL;
+
+// ThingsBoard QUOTA-SAFE policy
+// - Local sensors/UI remain responsive; only the cloud upload is slowed down.
+// - One compact JSON message contains 8 essential telemetry keys.
+// - Default: one message every 10 minutes (about 34,560 data points/month/device).
+// - Hard limiter: at most 8 telemetry messages in any one-hour window.
+// - No immediate burst after MQTT reconnect and no rapid retry after publish failure.
+static constexpr uint32_t TELEMETRY_INTERVAL_MS = 10UL * 60UL * 1000UL;
+static constexpr uint32_t TELEMETRY_FIRST_SEND_DELAY_MS = 60UL * 1000UL;
+static constexpr uint32_t TELEMETRY_RECONNECT_SETTLE_MS = 30UL * 1000UL;
+static constexpr uint32_t TELEMETRY_MIN_GAP_MS = 60UL * 1000UL;
+static constexpr uint32_t TELEMETRY_FAILURE_BACKOFF_MS = 15UL * 60UL * 1000UL;
+static constexpr uint32_t TELEMETRY_RATE_WINDOW_MS = 60UL * 60UL * 1000UL;
+static constexpr uint8_t TELEMETRY_MAX_MESSAGES_PER_WINDOW = 8;
+static constexpr uint8_t TELEMETRY_KEYS_PER_MESSAGE = 8;
+
 static constexpr uint32_t SERIAL_DATA_LOG_INTERVAL_MS = 15000UL;
 static constexpr uint32_t WIFI_RETRY_MS = 20000UL;
-static constexpr uint32_t MQTT_RETRY_MIN_MS = 60000UL;
-static constexpr uint32_t MQTT_RETRY_MAX_MS = 180000UL;
-static constexpr uint16_t MQTT_KEEP_ALIVE_SEC = 30;
+// MQTT reconnect is deliberately conservative so a disabled/rate-limited tenant
+// is not hammered by repeated connection attempts.
+static constexpr uint32_t MQTT_RETRY_MIN_MS = 2UL * 60UL * 1000UL;
+static constexpr uint32_t MQTT_RETRY_MAX_MS = 30UL * 60UL * 1000UL;
+static constexpr uint16_t MQTT_KEEP_ALIVE_SEC = 60;
 static constexpr uint16_t MQTT_SOCKET_TIMEOUT_SEC = 1;
-static constexpr uint16_t MQTT_BUFFER_SIZE = 1400;
+static constexpr uint16_t MQTT_BUFFER_SIZE = 1024;
 
 // -----------------------------------------------------------------------------
 // 9) MQ-135 relative gas trend

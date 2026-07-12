@@ -1,5 +1,5 @@
 /*
-  HP14 v1.1.0 WIFI-PORTAL-STABLE - Deep Work Environment Monitor
+  HP14 v1.2.1 QUOTA-SAFE - Deep Work Environment Monitor
   Board: ESP32-C6 DevKitC-1
 
   FILE STRUCTURE
@@ -18,7 +18,7 @@
   GPIO1  -> PAGE: next screen.
   GPIO11 -> FOCUS: start/stop a local Deep Work session.
   Hold both buttons 5 seconds -> open HP14-SETUP portal.
-Wi-Fi provisioning uses cached scanning and pending credentials: HTTP handlers never scan; new Wi-Fi is committed only after successful connection.
+Wi-Fi provisioning uses cached scanning and pending credentials: HTTP handlers never scan; new Wi-Fi is committed only after successful connection. The device retains the 5 most recently successful Wi-Fi networks and roams through them automatically. ThingsBoard telemetry is compact, rate-limited and reconnect-safe.
   A short chord window prevents the combined hold from accidentally changing page/session.
 
   Current TFT wiring:
@@ -138,6 +138,25 @@ String pendingWifiPassword;
 bool pendingWifiValid = false;
 bool tryingPendingWifi = false;
 
+// Five-network MRU vault. Index 0 is the most recently successful network.
+struct SavedWifiEntry {
+  String ssid;
+  String password;
+};
+SavedWifiEntry wifiVault[WIFI_SAVED_NETWORK_LIMIT];
+uint8_t wifiVaultCount = 0;
+uint8_t wifiVaultNextIndex = 0;
+int8_t wifiActiveVaultIndex = -1;
+String lastRememberedConnectedSsid;
+uint8_t wifiVaultCandidateOrder[WIFI_SAVED_NETWORK_LIMIT] = {};
+uint8_t wifiVaultCandidateCount = 0;
+uint8_t wifiVaultCandidateCursor = 0;
+bool wifiVaultCandidateOrderReady = false;
+uint8_t wifiSavedScanRound = 0;
+
+void setWifiVaultCandidateOrderMru();
+void prepareWifiVaultCandidateOrder();
+
 // Wi-Fi provisioning UI state. v1.0 follows HP13's proven save-and-restart model.
 // The phase values are retained for display/telemetry compatibility only.
 enum WifiProvisionPhase : uint8_t {
@@ -166,6 +185,7 @@ bool wifiEverConnected = false;
 uint8_t wifiBootAttemptCount = 0;
 uint32_t wifiAttemptStartedMs = 0;
 uint32_t wifiBootWindowStartedMs = 0;
+uint32_t wifiCycleRetryNotBeforeMs = 0;
 
 // Deep Work local focus-session state — the ACTION button now has a useful,
 // non-duplicate role instead of merely moving backward through pages.
@@ -216,7 +236,13 @@ uint8_t gasHistoryHead = 0;
 
 // Scheduler / network.
 uint32_t lastSensorMs = 0;
-uint32_t lastTelemetryMs = 0;
+uint32_t lastTelemetryMs = 0;          // last successful ThingsBoard publish
+uint32_t lastTelemetryAttemptMs = 0;   // hard anti-hammer guard
+uint32_t telemetryNextAttemptNotBeforeMs = 0;
+uint32_t telemetryWindowStartedMs = 0;
+uint8_t telemetryMessagesThisWindow = 0;
+bool telemetryQuotaLogPrinted = false;
+uint32_t mqttConnectedSinceMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 uint32_t lastMqttAttemptMs = 0;
 uint32_t mqttRetryMs = MQTT_RETRY_MIN_MS;
@@ -465,25 +491,333 @@ bool credentialsConfigured() {
   return wifiCredentialsConfigured() && cloudCredentialsConfigured();
 }
 
+void wifiVaultKey(char *out, size_t outSize, char kind, uint8_t index) {
+  snprintf(out, outSize, "wv%c%u", kind, index);
+}
+
+int findWifiVaultIndex(const String &ssid) {
+  for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+    if (wifiVault[i].ssid == ssid) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+void clearWifiVaultRam() {
+  for (uint8_t i = 0; i < WIFI_SAVED_NETWORK_LIMIT; ++i) {
+    wifiVault[i].ssid = "";
+    wifiVault[i].password = "";
+  }
+  wifiVaultCount = 0;
+}
+
+bool persistWifiVault() {
+  preferences.putUShort("wvSchema", WIFI_VAULT_SCHEMA_VERSION);
+  preferences.putUShort("wvCount", wifiVaultCount);
+
+  for (uint8_t i = 0; i < WIFI_SAVED_NETWORK_LIMIT; ++i) {
+    char ssidKey[8];
+    char passKey[8];
+    wifiVaultKey(ssidKey, sizeof(ssidKey), 'S', i);
+    wifiVaultKey(passKey, sizeof(passKey), 'P', i);
+    if (i < wifiVaultCount) {
+      preferences.putString(ssidKey, wifiVault[i].ssid);
+      preferences.putString(passKey, wifiVault[i].password);
+    } else {
+      preferences.remove(ssidKey);
+      preferences.remove(passKey);
+    }
+  }
+
+  // Compatibility mirror for older HP14 releases and external diagnostics.
+  if (wifiVaultCount > 0) {
+    preferences.putString("wifiSsid", wifiVault[0].ssid);
+    preferences.putString("wifiPass", wifiVault[0].password);
+    preferences.putString("ssid", wifiVault[0].ssid);
+    preferences.putString("pass", wifiVault[0].password);
+  }
+  delay(20);
+
+  const uint8_t verifyCount = static_cast<uint8_t>(preferences.getUShort("wvCount", 0));
+  if (verifyCount != wifiVaultCount) return false;
+  if (wifiVaultCount > 0) {
+    const String verifySsid = preferences.getString("wvS0", "");
+    if (verifySsid != wifiVault[0].ssid) return false;
+  }
+  return true;
+}
+
+bool promoteWifiInVault(const String &ssidInput, const String &passwordInput,
+                        bool writeToFlash = true) {
+  String ssid = ssidInput;
+  ssid.trim();
+  if (isPlaceholder(ssid)) return false;
+
+  int existing = findWifiVaultIndex(ssid);
+  String password = passwordInput;
+  if (existing >= 0 && password.length() == 0 &&
+      wifiVault[existing].password.length() > 0) {
+    password = wifiVault[existing].password;
+  }
+
+  // Already the newest entry with unchanged credentials: avoid needless NVS writes.
+  if (existing == 0 && wifiVault[0].password == password) {
+    savedWifiSsid = wifiVault[0].ssid;
+    savedWifiPassword = wifiVault[0].password;
+    wifiActiveVaultIndex = 0;
+    setWifiVaultCandidateOrderMru();
+    wifiVaultCandidateCursor = wifiVaultCount > 0 ? 1 : 0;
+    return true;
+  }
+
+  if (existing >= 0) {
+    for (uint8_t i = static_cast<uint8_t>(existing); i + 1U < wifiVaultCount; ++i) {
+      wifiVault[i] = wifiVault[i + 1U];
+    }
+    --wifiVaultCount;
+  } else if (wifiVaultCount >= WIFI_SAVED_NETWORK_LIMIT) {
+    // Drop the oldest entry before inserting the newly successful network.
+    wifiVaultCount = WIFI_SAVED_NETWORK_LIMIT - 1U;
+  }
+
+  for (uint8_t i = wifiVaultCount; i > 0; --i) {
+    wifiVault[i] = wifiVault[i - 1U];
+  }
+  wifiVault[0].ssid = ssid;
+  wifiVault[0].password = password;
+  if (wifiVaultCount < WIFI_SAVED_NETWORK_LIMIT) ++wifiVaultCount;
+
+  savedWifiSsid = wifiVault[0].ssid;
+  savedWifiPassword = wifiVault[0].password;
+  wifiActiveVaultIndex = 0;
+  wifiVaultNextIndex = wifiVaultCount > 0 ? 1 : 0;
+  setWifiVaultCandidateOrderMru();
+  wifiVaultCandidateCursor = wifiVaultCount > 0 ? 1 : 0;
+
+  if (!writeToFlash) return true;
+  const bool ok = persistWifiVault();
+  Serial.printf("[WiFi] Vault %s: %s (%u/%u saved)\n",
+                ok ? "updated" : "write FAILED", ssid.c_str(),
+                wifiVaultCount, WIFI_SAVED_NETWORK_LIMIT);
+  return ok;
+}
+
+void loadWifiVault() {
+  clearWifiVaultRam();
+  const uint8_t storedRawCount = static_cast<uint8_t>(preferences.getUShort("wvCount", 0));
+  const uint8_t storedCount = storedRawCount < WIFI_SAVED_NETWORK_LIMIT
+                                  ? storedRawCount
+                                  : WIFI_SAVED_NETWORK_LIMIT;
+
+  for (uint8_t i = 0; i < storedCount; ++i) {
+    char ssidKey[8];
+    char passKey[8];
+    wifiVaultKey(ssidKey, sizeof(ssidKey), 'S', i);
+    wifiVaultKey(passKey, sizeof(passKey), 'P', i);
+    String ssid = preferences.getString(ssidKey, "");
+    String password = preferences.getString(passKey, "");
+    ssid.trim();
+    if (isPlaceholder(ssid) || findWifiVaultIndex(ssid) >= 0) continue;
+    wifiVault[wifiVaultCount].ssid = ssid;
+    wifiVault[wifiVaultCount].password = password;
+    ++wifiVaultCount;
+  }
+
+  // One-time migration from v1.1 single-network keys / secrets.h fallback.
+  const String legacySsid = preferences.getString(
+      "wifiSsid", preferences.getString("ssid", WIFI_SSID));
+  const String legacyPassword = preferences.getString(
+      "wifiPass", preferences.getString("pass", WIFI_PASSWORD));
+  if (wifiVaultCount == 0 && !isPlaceholder(legacySsid)) {
+    promoteWifiInVault(legacySsid, legacyPassword, true);
+    Serial.printf("[WiFi] Migrated legacy WiFi into 5-network vault: %s\n",
+                  legacySsid.c_str());
+  } else if (wifiVaultCount > 0) {
+    savedWifiSsid = wifiVault[0].ssid;
+    savedWifiPassword = wifiVault[0].password;
+  }
+
+  Serial.printf("[WiFi] Vault loaded: %u/%u network(s).\n",
+                wifiVaultCount, WIFI_SAVED_NETWORK_LIMIT);
+  for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+    Serial.printf("[WiFi]   MRU #%u: %s\n", i + 1U, wifiVault[i].ssid.c_str());
+  }
+}
+
+void setWifiVaultCandidateOrderMru() {
+  wifiVaultCandidateCount = 0;
+  wifiVaultCandidateCursor = 0;
+  for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+    wifiVaultCandidateOrder[wifiVaultCandidateCount++] = i;
+  }
+  wifiVaultCandidateOrderReady = true;
+}
+
+void prepareWifiVaultCandidateOrder() {
+  wifiVaultCandidateCount = 0;
+  wifiVaultCandidateCursor = 0;
+  wifiVaultCandidateOrderReady = true;
+  if (wifiVaultCount == 0) return;
+
+  if (!WIFI_SCAN_SAVED_NETWORKS_ON_BOOT) {
+    setWifiVaultCandidateOrderMru();
+    return;
+  }
+
+  if (wifiSavedScanRound < 255) ++wifiSavedScanRound;
+  Serial.printf("[WiFi] Scanning round %u/%u for %u saved network(s)...\n",
+                wifiSavedScanRound, WIFI_SAVED_SCAN_MAX_ROUNDS, wifiVaultCount);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, false);
+  delay(60);
+  const int scanCount = WiFi.scanNetworks(false, true, false,
+                                           WIFI_PORTAL_SCAN_MS_PER_CHANNEL);
+  if (scanCount < 0) {
+    Serial.printf("[WiFi] Saved-network scan failed (%d); falling back to MRU order.\n",
+                  scanCount);
+    WiFi.scanDelete();
+    setWifiVaultCandidateOrderMru();
+    return;
+  }
+
+  int bestRssi[WIFI_SAVED_NETWORK_LIMIT];
+  bool selected[WIFI_SAVED_NETWORK_LIMIT];
+  for (uint8_t i = 0; i < WIFI_SAVED_NETWORK_LIMIT; ++i) {
+    bestRssi[i] = -127;
+    selected[i] = false;
+  }
+
+  for (int scanIndex = 0; scanIndex < scanCount; ++scanIndex) {
+    const String scannedSsid = WiFi.SSID(scanIndex);
+    const int vaultIndex = findWifiVaultIndex(scannedSsid);
+    if (vaultIndex >= 0 && WiFi.RSSI(scanIndex) > bestRssi[vaultIndex]) {
+      bestRssi[vaultIndex] = WiFi.RSSI(scanIndex);
+    }
+  }
+
+  // Strongest visible saved network first; MRU order breaks equal-RSSI ties.
+  while (wifiVaultCandidateCount < wifiVaultCount) {
+    int chosen = -1;
+    int chosenRssi = -128;
+    for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+      if (selected[i] || bestRssi[i] <= -127) continue;
+      if (chosen < 0 || bestRssi[i] > chosenRssi) {
+        chosen = static_cast<int>(i);
+        chosenRssi = bestRssi[i];
+      }
+    }
+    if (chosen < 0) break;
+    selected[chosen] = true;
+    wifiVaultCandidateOrder[wifiVaultCandidateCount++] = static_cast<uint8_t>(chosen);
+  }
+
+  if (WIFI_TRY_SAVED_HIDDEN_NETWORKS) {
+    for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+      if (!selected[i]) wifiVaultCandidateOrder[wifiVaultCandidateCount++] = i;
+    }
+  }
+
+  // First scan after boot: if the router is still starting after a power cut,
+  // give the most recently used network one normal connection window, then rescan.
+  if (wifiVaultCandidateCount == 0 && wifiSavedScanRound == 1 && wifiVaultCount > 0) {
+    wifiVaultCandidateOrder[wifiVaultCandidateCount++] = 0;
+    Serial.printf("[WiFi] No saved SSID visible yet; grace attempt for MRU: %s\n",
+                  wifiVault[0].ssid.c_str());
+  }
+
+  WiFi.scanDelete();
+  Serial.printf("[WiFi] Visible saved candidates: %u/%u.\n",
+                wifiVaultCandidateCount, wifiVaultCount);
+  for (uint8_t i = 0; i < wifiVaultCandidateCount; ++i) {
+    const uint8_t index = wifiVaultCandidateOrder[i];
+    Serial.printf("[WiFi]   Candidate #%u: %s RSSI=%d dBm\n",
+                  i + 1U, wifiVault[index].ssid.c_str(), bestRssi[index]);
+  }
+}
+
+bool activateWifiVaultIndex(uint8_t index) {
+  if (index >= wifiVaultCount || isPlaceholder(wifiVault[index].ssid)) return false;
+  activeWifiSsid = wifiVault[index].ssid;
+  activeWifiPassword = wifiVault[index].password;
+  wifiActiveVaultIndex = static_cast<int8_t>(index);
+  wifiBootAttemptCount = 0;
+  wifiAttemptActive = false;
+  lastWifiAttemptMs = 0;
+  wifiCycleRetryNotBeforeMs = 0;
+  Serial.printf("[WiFi] Selected saved network %u/%u: %s\n",
+                index + 1U, wifiVaultCount, activeWifiSsid.c_str());
+  return true;
+}
+
+void resetWifiVaultCandidateCycle() {
+  wifiVaultNextIndex = 0;
+  wifiActiveVaultIndex = -1;
+  wifiVaultCandidateCount = 0;
+  wifiVaultCandidateCursor = 0;
+  wifiVaultCandidateOrderReady = false;
+  wifiBootAttemptCount = 0;
+  wifiAttemptActive = false;
+  lastWifiAttemptMs = 0;
+}
+
+bool activateNextSavedWifi() {
+  if (!wifiVaultCandidateOrderReady) prepareWifiVaultCandidateOrder();
+  while (wifiVaultCandidateCursor < wifiVaultCandidateCount) {
+    const uint8_t index = wifiVaultCandidateOrder[wifiVaultCandidateCursor++];
+    wifiVaultNextIndex = wifiVaultCandidateCursor;
+    if (activateWifiVaultIndex(index)) return true;
+  }
+  return false;
+}
+
+void resetWifiCycleToMostRecent() {
+  resetWifiVaultCandidateCycle();
+  setWifiVaultCandidateOrderMru();
+  activateNextSavedWifi();
+}
+
+void rememberConnectedWifi() {
+  const String connectedSsid = WiFi.SSID();
+  if (connectedSsid.length() == 0 || connectedSsid == lastRememberedConnectedSsid) return;
+  if (promoteWifiInVault(connectedSsid, activeWifiPassword, true)) {
+    lastRememberedConnectedSsid = connectedSsid;
+    activeWifiSsid = wifiVault[0].ssid;
+    activeWifiPassword = wifiVault[0].password;
+    Serial.printf("[WiFi] MRU promoted after successful connection: %s\n",
+                  connectedSsid.c_str());
+  }
+}
+
+void printWifiVault() {
+  Serial.printf("[WiFi] Saved vault: %u/%u (newest successful first)\n",
+                wifiVaultCount, WIFI_SAVED_NETWORK_LIMIT);
+  for (uint8_t i = 0; i < wifiVaultCount; ++i) {
+    Serial.printf("[WiFi]   #%u %s\n", i + 1U, wifiVault[i].ssid.c_str());
+  }
+}
+
 void loadNetworkSettings() {
-  savedWifiSsid = preferences.getString("wifiSsid",
-                    preferences.getString("ssid", WIFI_SSID));
-  savedWifiPassword = preferences.getString("wifiPass",
-                        preferences.getString("pass", WIFI_PASSWORD));
+  loadWifiVault();
 
   pendingWifiSsid = preferences.getString("pendingSsid", "");
   pendingWifiPassword = preferences.getString("pendingPass", "");
   pendingWifiValid = preferences.getBool("pendingValid", false) &&
                      pendingWifiSsid.length() > 0;
 
+  resetWifiVaultCandidateCycle();
   tryingPendingWifi = pendingWifiValid;
   if (tryingPendingWifi) {
     activeWifiSsid = pendingWifiSsid;
     activeWifiPassword = pendingWifiPassword;
     Serial.printf("[WiFi] Pending candidate found: %s\n", activeWifiSsid.c_str());
+  } else if (wifiVaultCount > 0) {
+    prepareWifiVaultCandidateOrder();
+    activateNextSavedWifi();
   } else {
-    activeWifiSsid = savedWifiSsid;
-    activeWifiPassword = savedWifiPassword;
+    activeWifiSsid = "";
+    activeWifiPassword = "";
   }
 
   activeTbHost = preferences.getString("tbHost", TB_HOST);
@@ -898,7 +1232,191 @@ void sampleSensors() {
 }
 
 // =============================================================================
-// 10) Wi-Fi setup portal + network
+// 10) ThingsBoard / MQTT — compact, quota-safe and reconnect-safe
+// =============================================================================
+
+String buildMqttClientId() {
+  const uint64_t chipId = ESP.getEfuseMac();
+  char id[32];
+  snprintf(id, sizeof(id), "HP14-%04X%08X",
+           static_cast<uint16_t>(chipId >> 32),
+           static_cast<uint32_t>(chipId));
+  return String(id);
+}
+
+void serviceMqtt(uint32_t now) {
+  if (portalActive || !cloudCredentialsConfigured() ||
+      WiFi.status() != WL_CONNECTED) {
+    if (mqttClient.connected()) mqttClient.disconnect();
+    if (previousMqttConnected) {
+      previousMqttConnected = false;
+      mqttConnectedSinceMs = 0;
+      uiDirty = true;
+    }
+    return;
+  }
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    if (!previousMqttConnected) {
+      previousMqttConnected = true;
+      mqttConnectedSinceMs = now;
+      uiDirty = true;
+      Serial.println(F("[MQTT] ThingsBoard connected; quota-safe settle timer started."));
+    }
+    return;
+  }
+
+  if (previousMqttConnected) {
+    previousMqttConnected = false;
+    mqttConnectedSinceMs = 0;
+    uiDirty = true;
+  }
+
+  if (lastMqttAttemptMs > 0 && (now - lastMqttAttemptMs) < mqttRetryMs) return;
+  if (menuButton.isPressed() || ackButton.isPressed() || dualHoldActive) return;
+  if ((now - lastUserActionMs) < 2500UL) return;
+
+  lastMqttAttemptMs = now;
+  const String clientId = buildMqttClientId();
+  Serial.printf("[MQTT] Connecting to %s:%u ...\n",
+                activeTbHost.c_str(), activeTbPort);
+
+  if (mqttClient.connect(clientId.c_str(), activeTbToken.c_str(), nullptr)) {
+    mqttRetryMs = MQTT_RETRY_MIN_MS;
+    mqttPublishFailures = 0;
+    previousMqttConnected = true;
+    mqttConnectedSinceMs = now;
+    uiDirty = true;
+    Serial.println(F("[MQTT] Connected. No reconnect telemetry burst will be sent."));
+  } else {
+    Serial.printf("[MQTT] Connect failed, state=%d; next retry is backed off.\n",
+                  mqttClient.state());
+    mqttRetryMs = min(mqttRetryMs * 2UL, MQTT_RETRY_MAX_MS);
+  }
+}
+
+void formatJsonFloat(float value, char *buffer, size_t size, uint8_t decimals) {
+  if (!isfinite(value)) {
+    snprintf(buffer, size, "null");
+    return;
+  }
+  snprintf(buffer, size, "%.*f", decimals, value);
+}
+
+void resetTelemetryRateWindowIfNeeded(uint32_t now) {
+  if (telemetryWindowStartedMs == 0 ||
+      (now - telemetryWindowStartedMs) >= TELEMETRY_RATE_WINDOW_MS) {
+    telemetryWindowStartedMs = now;
+    telemetryMessagesThisWindow = 0;
+    telemetryQuotaLogPrinted = false;
+  }
+}
+
+bool telemetryRatePermit(uint32_t now) {
+  resetTelemetryRateWindowIfNeeded(now);
+
+  if (telemetryMessagesThisWindow >= TELEMETRY_MAX_MESSAGES_PER_WINDOW) {
+    if (!telemetryQuotaLogPrinted) {
+      telemetryQuotaLogPrinted = true;
+      Serial.printf("[TB] Hourly safety cap reached (%u messages). Cloud upload paused until next window.\n",
+                    TELEMETRY_MAX_MESSAGES_PER_WINDOW);
+    }
+    return false;
+  }
+
+  if (lastTelemetryAttemptMs > 0 &&
+      (now - lastTelemetryAttemptMs) < TELEMETRY_MIN_GAP_MS) {
+    return false;
+  }
+
+  if (telemetryNextAttemptNotBeforeMs > 0 &&
+      static_cast<int32_t>(now - telemetryNextAttemptNotBeforeMs) < 0) {
+    return false;
+  }
+
+  return true;
+}
+
+bool publishTelemetry() {
+  if (!mqttClient.connected()) return false;
+
+  char t[20], h[20], hi[20], ratio[20];
+  formatJsonFloat(data.temperatureC, t, sizeof(t), 1);
+  formatJsonFloat(data.humidityPct, h, sizeof(h), 1);
+  formatJsonFloat(data.heatIndexC, hi, sizeof(hi), 1);
+  formatJsonFloat(data.gasRatio, ratio, sizeof(ratio), 3);
+
+  // Exactly 8 essential keys. High-volume diagnostics stay local on Serial/TFT/OLED.
+  char payload[512];
+  const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
+  const int written = snprintf(
+      payload, sizeof(payload),
+      "{"
+      "\"temperature\":%s,"
+      "\"humidity\":%s,"
+      "\"heatIndex\":%s,"
+      "\"dwScoreExperimental\":%d,"
+      "\"dwScoreValid\":%s,"
+      "\"environmentState\":\"%s\","
+      "\"gasRatioRelative\":%s,"
+      "\"wifiRssi\":%d"
+      "}",
+      t, h, hi, data.experimentalScore,
+      data.scoreValid ? "true" : "false",
+      stateCode(data.state), ratio, rssi);
+
+  if (written <= 0 || written >= static_cast<int>(sizeof(payload))) {
+    Serial.println(F("[TB] Compact payload overflow; telemetry not sent."));
+    return false;
+  }
+
+  const bool ok = mqttClient.publish("v1/devices/me/telemetry", payload, false);
+  if (ok) {
+    mqttPublishFailures = 0;
+    Serial.printf("[TB] Quota-safe telemetry published: %u keys, %d bytes.\n",
+                  TELEMETRY_KEYS_PER_MESSAGE, written);
+  } else {
+    if (mqttPublishFailures < 255) ++mqttPublishFailures;
+    Serial.printf("[TB] Publish failed; backing off for %lu minutes without reconnect hammering.\n",
+                  static_cast<unsigned long>(TELEMETRY_FAILURE_BACKOFF_MS / 60000UL));
+  }
+  return ok;
+}
+
+void serviceTelemetry(uint32_t now) {
+  if (!mqttClient.connected() || data.sampleCounter == 0) return;
+
+  // Always let the MQTT session settle after connect/reconnect.
+  if (mqttConnectedSinceMs == 0 ||
+      (now - mqttConnectedSinceMs) < TELEMETRY_RECONNECT_SETTLE_MS) {
+    return;
+  }
+
+  const bool firstSendDue = (lastTelemetryMs == 0) &&
+                            (now >= TELEMETRY_FIRST_SEND_DELAY_MS);
+  const bool periodicSendDue = (lastTelemetryMs > 0) &&
+                               ((now - lastTelemetryMs) >= TELEMETRY_INTERVAL_MS);
+  if (!firstSendDue && !periodicSendDue) return;
+  if (!telemetryRatePermit(now)) return;
+
+  // Mark the attempt before publishing so a failure can never create a tight loop.
+  lastTelemetryAttemptMs = now;
+  if (publishTelemetry()) {
+    lastTelemetryMs = now;
+    telemetryNextAttemptNotBeforeMs = now + TELEMETRY_INTERVAL_MS;
+    if (telemetryMessagesThisWindow < 255) ++telemetryMessagesThisWindow;
+    Serial.printf("[TB] Window usage: %u/%u messages; next normal upload in %lu minutes.\n",
+                  telemetryMessagesThisWindow,
+                  TELEMETRY_MAX_MESSAGES_PER_WINDOW,
+                  static_cast<unsigned long>(TELEMETRY_INTERVAL_MS / 60000UL));
+  } else {
+    telemetryNextAttemptNotBeforeMs = now + TELEMETRY_FAILURE_BACKOFF_MS;
+  }
+}
+
+// =============================================================================
+// 11) Wi-Fi setup portal + network
 // =============================================================================
 
 String htmlEscape(const String &in) {
@@ -948,26 +1466,20 @@ void clearPendingWifi() {
 bool commitPendingWifi() {
   if (!tryingPendingWifi || !pendingWifiValid || pendingWifiSsid.length() == 0) return true;
 
-  const size_t a = preferences.putString("wifiSsid", pendingWifiSsid);
-  const size_t b = preferences.putString("wifiPass", pendingWifiPassword);
-  preferences.putString("ssid", pendingWifiSsid);
-  preferences.putString("pass", pendingWifiPassword);
-  delay(20);
-
-  const String verify = preferences.getString("wifiSsid", "");
-  if (a == 0 || verify != pendingWifiSsid) {
-    Serial.println(F("[WiFi] Candidate connected but commit verification failed."));
-    (void)b;
+  const String committedSsid = pendingWifiSsid;
+  const String committedPassword = pendingWifiPassword;
+  if (!promoteWifiInVault(committedSsid, committedPassword, true)) {
+    Serial.println(F("[WiFi] Candidate connected but 5-network vault commit failed."));
     return false;
   }
 
-  savedWifiSsid = pendingWifiSsid;
-  savedWifiPassword = pendingWifiPassword;
-  activeWifiSsid = savedWifiSsid;
-  activeWifiPassword = savedWifiPassword;
+  activeWifiSsid = committedSsid;
+  activeWifiPassword = committedPassword;
   clearPendingWifi();
+  lastRememberedConnectedSsid = committedSsid;
   preferences.putString("lastWifiFail", "connected-new-wifi");
-  Serial.printf("[WiFi] New WiFi committed: %s\n", activeWifiSsid.c_str());
+  Serial.printf("[WiFi] New WiFi committed to MRU vault: %s (%u/%u)\n",
+                activeWifiSsid.c_str(), wifiVaultCount, WIFI_SAVED_NETWORK_LIMIT);
   return true;
 }
 
@@ -1082,13 +1594,13 @@ String portalPage(const String &message = "") {
             "<script>function pick(s){document.getElementById('ssid').value=s;document.getElementById('pass').focus()}function togglePass(){var p=document.getElementById('pass');p.type=p.type==='password'?'text':'password'}</script>"
             "</head><body><div class='wrap'><div class='card'>");
   page += F("<h1>HP14 WiFi Setup</h1>");
-  page += F("<div class='sub'>HP14 giữ WiFi đang hoạt động, lưu mạng mới ở vùng chờ, khởi động lại để kiểm tra rồi chỉ xác nhận mạng mới khi kết nối thành công.</div>");
+  page += F("<div class='sub'>HP14 giữ tối đa 5 WiFi đã kết nối thành công gần nhất. Mạng mới chỉ được đưa vào bộ nhớ sau khi kiểm tra kết nối thành công.</div>");
   page += F("<div><span class='pill'>AP: "); page += htmlEscape(portalSsid);
   page += F("</span><span class='pill'>IP: 192.168.4.1</span><span class='pill'>Pass AP: ");
-  page += WIFI_SETUP_AP_PASSWORD; page += F("</span></div>");
+  page += WIFI_SETUP_AP_PASSWORD; page += F("</span><span class='pill'>Đã nhớ: "); page += String(wifiVaultCount); page += F("/5 WiFi</span></div>");
   if (message.length()) page += String(F("<div class='info'>")) + htmlEscape(message) + F("</div>");
   page += F("<div class='warn'><b>Nếu điện thoại báo không có Internet:</b><br>chọn <b>Vẫn kết nối / Use without Internet / Keep WiFi connection</b>. Không chuyển điện thoại sang mạng khác trong lúc điền biểu mẫu.</div>");
-  page += F("<div class='info'><b>Cách vận hành:</b><br>1. Chọn WiFi 2.4GHz hoặc nhập SSID.<br>2. Nhập mật khẩu.<br>3. Nhấn Lưu & kiểm tra mạng mới.<br>4. Nếu thất bại, portal mở lại và WiFi cũ vẫn được giữ.</div>");
+  page += F("<div class='info'><b>Cách vận hành:</b><br>1. Chọn WiFi 2.4GHz hoặc nhập SSID.<br>2. Nhập mật khẩu.<br>3. Nhấn Lưu & kiểm tra mạng mới.<br>4. Nếu thành công, mạng này lên vị trí số 1 trong kho 5 WiFi; mạng thứ 6 sẽ thay mạng cũ nhất.<br>5. Nếu thất bại, kho WiFi cũ không bị thay đổi.</div>");
   page += F("<h2>WiFi 2.4GHz quét được</h2>");
   page += portalNetworksHtml();
   page += F("<form method='POST' action='/save'>");
@@ -1101,7 +1613,7 @@ String portalPage(const String &message = "") {
   page += F("<button class='btn' type='submit'>Lưu & kiểm tra WiFi mới</button></form>");
   page += F("<form method='POST' action='/cancel'><button class='btn btn2' type='submit'>Hủy · quay lại WiFi đã lưu</button></form>");
   page += F("");
-  page += F("<p class='small'>Danh sách WiFi được quét một lần trước khi AP xuất hiện, nên trang không bị treo hoặc tự văng. Có thể nhập SSID bằng tay nếu mạng ẩn.</p>");
+  page += F("<p class='small'>HP14 tự thử lần lượt các WiFi đã nhớ khi khởi động hoặc khi đổi địa điểm. Danh sách quét chỉ dùng cho portal và không làm trang bị treo. Có thể nhập SSID bằng tay nếu mạng ẩn.</p>");
   page += F("</div></div></body></html>");
   return page;
 }
@@ -1112,7 +1624,7 @@ String portalProgressPage() {
   page += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>HP14 WiFi Saved</title><style>body{margin:0;background:#052b2f;color:#fff;font-family:Arial,Helvetica,sans-serif}.wrap{max-width:620px;margin:auto;padding:22px}.card{margin-top:8vh;background:linear-gradient(145deg,#007566,#073842);border:1px solid rgba(255,255,255,.22);border-radius:24px;padding:26px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.28)}.ok{width:64px;height:64px;border-radius:50%;margin:0 auto 16px;background:#73ffd2;color:#052b2f;font-size:42px;line-height:64px;font-weight:900}h1{font-size:28px}.msg{color:#dff;line-height:1.6}.small{font-size:14px;color:#bfe7e5;margin-top:18px}</style></head><body><div class='wrap'><div class='card'><div class='ok'>✓</div><h1>Đã nhận WiFi mới</h1><div class='msg'>");
   page += htmlEscape(wifiProvisionMessage);
-  page += F("</div><div class='small'>HP14 sẽ khởi động lại và thử mạng mới. Chỉ khi kết nối thành công mạng mới mới trở thành cấu hình chính; nếu thất bại, portal sẽ mở lại và WiFi cũ vẫn còn.</div></div></div></body></html>");
+  page += F("</div><div class='small'>HP14 sẽ khởi động lại và thử mạng mới. Chỉ khi kết nối thành công, mạng mới được đưa lên đầu kho 5 WiFi; nếu thất bại, danh sách cũ vẫn nguyên vẹn.</div></div></div></body></html>");
   return page;
 }
 
@@ -1184,8 +1696,11 @@ void handlePortalSave() {
     return;
   }
 
-  if (ssid == savedWifiSsid && pass.length() == 0 && savedWifiPassword.length() > 0) {
-    pass = savedWifiPassword;
+  const int knownWifiIndex = findWifiVaultIndex(ssid);
+  if (pass.length() == 0 && knownWifiIndex >= 0 &&
+      wifiVault[knownWifiIndex].password.length() > 0) {
+    pass = wifiVault[knownWifiIndex].password;
+    Serial.printf("[PORTAL] Reusing stored password for known SSID=%s.\n", ssid.c_str());
   }
 
   if (!saveWifiCredentialsHp13Style(ssid, pass, token)) {
@@ -1199,7 +1714,7 @@ void handlePortalSave() {
 
   wifiProvisionPhase = WIFI_PROVISION_SUCCESS;
   wifiProvisionMessage = String(F("Đã lưu WiFi chờ: ")) + ssid +
-                         F(". HP14 sẽ khởi động lại để kiểm tra; WiFi cũ chưa bị xóa.");
+                         F(". HP14 sẽ khởi động lại để kiểm tra; kho 5 WiFi cũ chưa bị thay đổi.");
   showToast(F("WIFI RECEIVED · TESTING"), 3200);
   stopBuzzer();
   uiDirty = true;
@@ -1248,16 +1763,10 @@ void stopSetupPortal(bool reconnectSavedWifi) {
   uiDirty = true;
   lastTftPage = 255;
 
-  if (reconnectSavedWifi && savedWifiSsid.length() > 0) {
-    activeWifiSsid = savedWifiSsid;
-    activeWifiPassword = savedWifiPassword;
+  if (reconnectSavedWifi && wifiVaultCount > 0) {
     tryingPendingWifi = false;
-    WiFi.disconnect(false, false);
-    delay(80);
-    WiFi.begin(activeWifiSsid.c_str(), activeWifiPassword.c_str());
-    wifiAttemptStartedMs = millis();
-    lastWifiAttemptMs = wifiAttemptStartedMs;
-    wifiAttemptActive = true;
+    resetWifiCycleToMostRecent();
+    beginWifiAttempt();
   } else {
     wifiAttemptActive = false;
   }
@@ -1290,8 +1799,8 @@ void startSetupPortal(const String &reason) {
   portalReason = reason;
   wifiProvisionPhase = WIFI_PROVISION_READY;
   wifiProvisionMessage = (reason == "candidate-wifi-failed")
-      ? F("WiFi mới không kết nối được. WiFi cũ vẫn được giữ; hãy nhập lại.")
-      : F("Chọn WiFi 2.4GHz mới. WiFi đang hoạt động chưa bị xóa.");
+      ? F("WiFi mới không kết nối được. Kho 5 WiFi cũ vẫn được giữ; hãy kiểm tra lại mật khẩu.")
+      : F("Chọn WiFi 2.4GHz mới. HP14 vẫn giữ các mạng đã lưu trước đó.");
   candidateWifiSsid = "";
   candidateWifiPassword = "";
   candidateTbToken = "";
@@ -1403,171 +1912,106 @@ void serviceWifi(uint32_t now) {
   }
 
   if (status == WL_CONNECTED) {
-    if (!wifiEverConnected) {
+    const String connectedSsid = WiFi.SSID();
+    if (!wifiEverConnected || connectedSsid != lastRememberedConnectedSsid) {
       Serial.printf("[WiFi] Connected SSID=%s IP=%s RSSI=%d dBm\n",
-                    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                    connectedSsid.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
     }
+
     if (tryingPendingWifi) {
       if (!commitPendingWifi()) {
         Serial.println(F("[WiFi] Commit failed; keeping connection for this session."));
       }
+    } else {
+      rememberConnectedWifi();
     }
+
     wifiEverConnected = true;
+    wifiSavedScanRound = 0;
+    wifiCycleRetryNotBeforeMs = 0;
     wifiAttemptActive = false;
     wifiBootAttemptCount = 0;
+    setWifiVaultCandidateOrderMru();
+    wifiVaultCandidateCursor = wifiVaultCount > 0 ? 1 : 0;
+    wifiVaultNextIndex = wifiVaultCandidateCursor;
+    wifiActiveVaultIndex = wifiVaultCount > 0 ? 0 : -1;
     mqttRetryMs = MQTT_RETRY_MIN_MS;
     lastMqttAttemptMs = 0;
     return;
   }
 
   if (!wifiCredentialsConfigured()) {
-    startSetupPortal(F("no-wifi-credentials"));
+    if (activateNextSavedWifi()) {
+      beginWifiAttempt();
+    } else {
+      startSetupPortal(F("no-wifi-credentials"));
+    }
     return;
   }
 
   if (wifiAttemptActive && (now - wifiAttemptStartedMs) >= WIFI_CONNECT_ATTEMPT_TIMEOUT_MS) {
-    Serial.printf("[WiFi] Attempt timeout status=%d\n", static_cast<int>(status));
+    Serial.printf("[WiFi] Attempt timeout SSID=%s status=%d\n",
+                  activeWifiSsid.c_str(), static_cast<int>(status));
     WiFi.disconnect(false, false);
     wifiAttemptActive = false;
   }
 
-  if (!wifiEverConnected) {
-    if (!wifiAttemptActive && wifiBootAttemptCount < WIFI_BOOT_MAX_ATTEMPTS &&
-        (lastWifiAttemptMs == 0 || (now - lastWifiAttemptMs) >= WIFI_BOOT_RETRY_GAP_MS)) {
-      beginWifiAttempt();
-      return;
-    }
+  // Give the current candidate the configured number of attempts.
+  if (wifiCycleRetryNotBeforeMs > 0 &&
+      static_cast<int32_t>(now - wifiCycleRetryNotBeforeMs) < 0) {
+    return;
+  }
+  if (wifiCycleRetryNotBeforeMs > 0) wifiCycleRetryNotBeforeMs = 0;
 
-    if (!wifiAttemptActive && wifiBootAttemptCount >= WIFI_BOOT_MAX_ATTEMPTS) {
-      if (tryingPendingWifi) {
-        Serial.printf("[WiFi] Candidate failed: %s. Restoring previous WiFi record.\n",
-                      activeWifiSsid.c_str());
-        clearPendingWifi();
-        activeWifiSsid = savedWifiSsid;
-        activeWifiPassword = savedWifiPassword;
-        startSetupPortal(F("candidate-wifi-failed"));
-      } else {
-        Serial.println(F("[WiFi] Saved WiFi unavailable; opening setup portal without deleting it."));
-        startSetupPortal(F("saved-wifi-unreachable"));
+  if (!wifiAttemptActive && wifiBootAttemptCount < WIFI_BOOT_MAX_ATTEMPTS &&
+      (lastWifiAttemptMs == 0 || (now - lastWifiAttemptMs) >= WIFI_BOOT_RETRY_GAP_MS)) {
+    beginWifiAttempt();
+    return;
+  }
+
+  if (wifiAttemptActive || wifiBootAttemptCount < WIFI_BOOT_MAX_ATTEMPTS) return;
+
+  // The pending network is never inserted until it succeeds. If it fails,
+  // discard only the pending record and continue through all five known WiFis.
+  if (tryingPendingWifi) {
+    Serial.printf("[WiFi] Pending candidate failed: %s. Trying saved vault.\n",
+                  activeWifiSsid.c_str());
+    clearPendingWifi();
+    resetWifiVaultCandidateCycle();
+    prepareWifiVaultCandidateOrder();
+  }
+
+  if (activateNextSavedWifi()) {
+    beginWifiAttempt();
+    return;
+  }
+
+  if (!wifiEverConnected) {
+    if (wifiSavedScanRound < WIFI_SAVED_SCAN_MAX_ROUNDS) {
+      Serial.println(F("[WiFi] Saved candidates failed; rescanning once before portal."));
+      resetWifiVaultCandidateCycle();
+      prepareWifiVaultCandidateOrder();
+      if (activateNextSavedWifi()) {
+        beginWifiAttempt();
+        return;
       }
     }
+    Serial.println(F("[WiFi] All saved WiFi networks unavailable; opening setup portal without deleting the vault."));
+    startSetupPortal(F("saved-wifi-unreachable"));
     return;
   }
 
-  // Normal runtime reconnect: retry indefinitely without opening the portal
-  // because a temporary router outage should not force user intervention.
-  if (!wifiAttemptActive &&
-      (lastWifiAttemptMs == 0 || (now - lastWifiAttemptMs) >= WIFI_RETRY_MS)) {
-    wifiBootAttemptCount = 0;
-    beginWifiAttempt();
-  }
-}
-
-String buildMqttClientId() {
-  const uint64_t chipId = ESP.getEfuseMac();
-  char id[32];
-  snprintf(id, sizeof(id), "HP14-%04X%08X",
-           static_cast<uint16_t>(chipId >> 32), static_cast<uint32_t>(chipId));
-  return String(id);
-}
-
-void serviceMqtt(uint32_t now) {
-  if (portalActive || !cloudCredentialsConfigured() || WiFi.status() != WL_CONNECTED) {
-    if (mqttClient.connected()) mqttClient.disconnect();
-    return;
-  }
-  if (mqttClient.connected()) {
-    mqttClient.loop();
-    if (!previousMqttConnected) {
-      previousMqttConnected = true;
-      uiDirty = true;
-      Serial.println(F("[MQTT] ThingsBoard connected."));
-    }
-    return;
-  }
-  if (previousMqttConnected) {
-    previousMqttConnected = false;
-    uiDirty = true;
-  }
-  if ((now - lastMqttAttemptMs) < mqttRetryMs) return;
-  if (menuButton.isPressed() || ackButton.isPressed() || dualHoldActive) return;
-  if ((now - lastUserActionMs) < 2500UL) return;
-  lastMqttAttemptMs = now;
-
-  const String clientId = buildMqttClientId();
-  Serial.printf("[MQTT] Connecting to %s:%u ...\n", activeTbHost.c_str(), activeTbPort);
-  if (mqttClient.connect(clientId.c_str(), activeTbToken.c_str(), nullptr)) {
-    mqttRetryMs = MQTT_RETRY_MIN_MS;
-    mqttPublishFailures = 0;
-    previousMqttConnected = true;
-    uiDirty = true;
-    Serial.println(F("[MQTT] Connected."));
-  } else {
-    Serial.printf("[MQTT] Connect failed, state=%d\n", mqttClient.state());
-    mqttRetryMs = min(mqttRetryMs * 2UL, MQTT_RETRY_MAX_MS);
-  }
-}
-
-void formatJsonFloat(float value, char *buffer, size_t size, uint8_t decimals) {
-  if (!isfinite(value)) { snprintf(buffer, size, "null"); return; }
-  snprintf(buffer, size, "%.*f", decimals, value);
-}
-
-bool publishTelemetry() {
-  if (!mqttClient.connected()) return false;
-
-  char t[20], h[20], hi[20], ratio[20], change[20];
-  formatJsonFloat(data.temperatureC, t, sizeof(t), 2);
-  formatJsonFloat(data.humidityPct, h, sizeof(h), 2);
-  formatJsonFloat(data.heatIndexC, hi, sizeof(hi), 2);
-  formatJsonFloat(data.gasRatio, ratio, sizeof(ratio), 4);
-  formatJsonFloat(data.gasChangePct, change, sizeof(change), 2);
-
-  char payload[1200];
-  const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
-  const uint32_t uptimeSec = millis() / 1000UL;
-  const int written = snprintf(
-      payload, sizeof(payload),
-      "{"
-      "\"temperature\":%s,\"humidity\":%s,\"heatIndex\":%s,"
-      "\"dhtOk\":%s,\"dhtFresh\":%s,\"dhtFailureCount\":%u,"
-      "\"mq135Raw\":%u,\"mq135AdcMv\":%.1f,\"mq135SensorMv\":%.1f,"
-      "\"mq135FilteredMv\":%.1f,\"mq135BaselineMv\":%.1f,"
-      "\"mq135Ready\":%s,\"mq135Warmup\":%s,"
-      "\"gasRatioRelative\":%s,\"gasChangePctRelative\":%s,"
-      "\"thermalScoreExperimental\":%d,\"dwScoreExperimental\":%d,"
-      "\"dwScoreValid\":%s,\"environmentState\":\"%s\","
-      "\"currentPage\":%u,\"focusSessionActive\":%s,"
-      "\"focusSessionElapsedSec\":%lu,\"focusSessionCount\":%lu,"
-      "\"wifiPortalActive\":%s,\"wifiProvisionState\":\"%s\",\"wifiRssi\":%d,\"uptimeSec\":%lu,"
-      "\"firmwareVersion\":\"%s\"}",
-      t, h, hi, data.dhtOk ? "true" : "false", data.dhtFresh ? "true" : "false",
-      data.dhtFailureCount, data.mqRaw, data.mqAdcMv, data.mqSensorMv,
-      data.mqFilteredMv, data.mqBaselineMv, data.mqReady ? "true" : "false",
-      (!data.mqWarm || data.mqCalibrating) ? "true" : "false", ratio, change,
-      data.thermalScore, data.experimentalScore, data.scoreValid ? "true" : "false",
-      stateCode(data.state), currentPage + 1U, focusSessionActive ? "true" : "false",
-      static_cast<unsigned long>(focusElapsedSec()),
-      static_cast<unsigned long>(focusSessionCount), portalActive ? "true" : "false",
-      wifiProvisionPhaseCode(), rssi, static_cast<unsigned long>(uptimeSec), HP14_FIRMWARE_VERSION);
-
-  if (written <= 0 || written >= static_cast<int>(sizeof(payload))) {
-    Serial.println(F("[TB] Payload overflow; telemetry not sent."));
-    return false;
-  }
-  const bool ok = mqttClient.publish("v1/devices/me/telemetry", payload, false);
-  if (ok) {
-    mqttPublishFailures = 0;
-    Serial.printf("[TB] Telemetry published (%d bytes).\n", written);
-  } else {
-    ++mqttPublishFailures;
-    if (mqttPublishFailures >= 3) { mqttClient.disconnect(); mqttPublishFailures = 0; }
-  }
-  return ok;
+  // Runtime roaming: after all saved networks fail, wait and cycle again.
+  // Temporary router outages never delete credentials or force the portal.
+  resetWifiCycleToMostRecent();
+  lastWifiAttemptMs = now;
+  wifiCycleRetryNotBeforeMs = now + WIFI_RETRY_MS;
+  Serial.printf("[WiFi] All %u saved networks unavailable; retry cycle in %lus.\n",
+                wifiVaultCount, static_cast<unsigned long>(WIFI_RETRY_MS / 1000UL));
 }
 
 // =============================================================================
-// 11) OLED UI — compact and synchronized
+// 12) OLED UI — compact and synchronized
 // =============================================================================
 
 bool initOledAtAddress(uint8_t address) {
@@ -1997,11 +2441,11 @@ void serviceButtons(uint32_t now) {
 void serviceAlertReminder(uint32_t now){(void)now;/* Environment alerts intentionally silent. */}
 
 // =============================================================================
-// 14) Serial diagnostic console
+// 15) Serial diagnostic console
 // =============================================================================
 
 void runTftColorTest(){if(!FEATURE_TFT||!tftInitialized)return;Serial.println(F("[TEST] TFT colors -> UI"));tft.fillScreen(GC9A01A_RED);delay(180);tft.fillScreen(GC9A01A_GREEN);delay(180);tft.fillScreen(GC9A01A_BLUE);delay(180);lastTftPage=255;uiDirty=true;}
-void printDiagnosticHelp(){Serial.println(F("[CMD] n=PAGE, a=FOCUS, b=BUZZER, l=LED, t=TFT, c=MQ baseline, w=WIFI portal, p=pins"));}
+void printDiagnosticHelp(){Serial.println(F("[CMD] n=PAGE, a=FOCUS, b=BUZZER, l=LED, t=TFT, c=MQ baseline, w=WIFI portal, v=WIFI vault, p=pins"));}
 
 void serviceSerialConsole(){
   while(Serial.available()>0){char command=static_cast<char>(Serial.read());if(command>='A'&&command<='Z')command=command-'A'+'a';
@@ -2013,6 +2457,7 @@ void serviceSerialConsole(){
       case 't':runTftColorTest();break;
       case 'c':if(data.mqWarm&&data.mqElectricalOk){data.mqBaselineMv=0;preferences.remove("mqbase");startMqCalibration("serial command");currentPage=2;uiDirty=true;}else Serial.println(F("[CMD] MQ calibration blocked until warm-up."));break;
       case 'w':startSetupPortal(F("serial-command"));break;
+      case 'v':printWifiVault();break;
       case 'p':Serial.println(F("[PINMAP] TFT RST=0 PAGE=1 MQ=2 DHT=3 OLED=6/7 RGB=8"));Serial.println(F("[PINMAP] RED=10 FOCUS=11 BUZZER=15 TFT=18/19/20/21 GREEN=22 YELLOW=23"));break;
       case '\r':case '\n':case ' ':break;
       default:printDiagnosticHelp();break;
@@ -2021,7 +2466,7 @@ void serviceSerialConsole(){
 }
 
 // =============================================================================
-// 15) Setup and loop
+// 16) Setup and loop
 // =============================================================================
 
 void setup(){
@@ -2038,7 +2483,7 @@ void setup(){
 
   if(FEATURE_EXTERNAL_LEDS){pinMode(PIN_LED_GREEN,OUTPUT);pinMode(PIN_LED_YELLOW,OUTPUT);pinMode(PIN_LED_RED,OUTPUT);setExternalLeds(false,false,false);}
   menuButton.begin();ackButton.begin();
-  Serial.printf("[BTN] Boot PAGE(GPIO%u)=%d FOCUS(GPIO%u)=%d; both 5s opens WiFi setup.\n",PIN_BTN_MENU,menuButton.rawLevel(),PIN_BTN_ACK,ackButton.rawLevel());
+  Serial.printf("[BTN] Boot PAGE(GPIO%u)=%d FOCUS(GPIO%u)=%d; both 5s opens WiFi setup; vault keeps 5 newest successful networks.\n",PIN_BTN_MENU,menuButton.rawLevel(),PIN_BTN_ACK,ackButton.rawLevel());
 
   if(FEATURE_BOARD_RGB){boardRgb.begin();boardRgb.setBrightness(HP14_RGB_LED_BRIGHTNESS);setBoardRgb(8,0,8);}
   if(FEATURE_BUZZER&&!BUZZER_IS_ACTIVE){buzzer.pwmAttached=ledcAttach(PIN_BUZZER,PASSIVE_BUZZER_FREQUENCY_HZ,8);ledcWriteTone(PIN_BUZZER,0);}
@@ -2067,7 +2512,14 @@ void setup(){
     beginWifiAttempt();
   }
 
-  lastSensorMs=millis();lastAlertReminderMs=millis();data.state=STATE_BOOT;uiDirty=true;stopBuzzer();
+  const uint32_t bootNow = millis();
+  lastSensorMs=bootNow;lastAlertReminderMs=bootNow;data.state=STATE_BOOT;uiDirty=true;stopBuzzer();
+  telemetryWindowStartedMs=bootNow;
+  telemetryNextAttemptNotBeforeMs=bootNow+TELEMETRY_FIRST_SEND_DELAY_MS;
+  Serial.printf("[TB] QUOTA-SAFE: compact=%u keys, interval=%lumin, hard cap=%u messages/hour.\n",
+                TELEMETRY_KEYS_PER_MESSAGE,
+                static_cast<unsigned long>(TELEMETRY_INTERVAL_MS/60000UL),
+                TELEMETRY_MAX_MESSAGES_PER_WINDOW);
 }
 
 void loop(){
@@ -2075,7 +2527,7 @@ void loop(){
   serviceSerialConsole();serviceBuzzer(now);serviceButtons(now);servicePortal();serviceWifiProvisioning(now);serviceWifi(now);serviceMqtt(now);serviceBuzzer(millis());
 
   if((now-lastSensorMs)>=SENSOR_INTERVAL_MS){lastSensorMs=now;sampleSensors();}
-  if(mqttClient.connected()&&data.sampleCounter>0&&(lastTelemetryMs==0||(now-lastTelemetryMs)>=TELEMETRY_INTERVAL_MS)){lastTelemetryMs=now;publishTelemetry();}
+  serviceTelemetry(now);
   serviceAlertReminder(now);updateStatusLeds(now);
 
   if((now-lastUiServiceMs)>=UI_SERVICE_INTERVAL_MS){lastUiServiceMs=now;const bool tftPageChanged=(portalActive?250:(dualHoldActive?251:currentPage))!=lastTftPage;
